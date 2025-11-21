@@ -1,7 +1,9 @@
+# app/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 # from pathlib import Path
+from pathlib import Path # Path no importado (rompe la app al arrancar
 import io
 
 from .models import RenderRequest
@@ -67,7 +69,7 @@ async def render_presentation(request: RenderRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 
 @app.post("/render_pdf")
 async def render_presentation_pdf(request: RenderRequest):
@@ -77,6 +79,7 @@ async def render_presentation_pdf(request: RenderRequest):
     try:
         if not os.path.exists(TEMPLATE_PATH):
             raise HTTPException(status_code=500, detail="Template file not found.")
+        """
         overrides = requests.pricing_overrides
         replacements = {
             "{COMPANY_NAME}": request.company_name,
@@ -87,10 +90,20 @@ async def render_presentation_pdf(request: RenderRequest):
             "{EQUITY_FEE}": overrides.EQUITY_FEE,
             "{DATE}": request.proposal_date.strftime("%B %d, %Y"),
         }
+        """
+        # 1) Reutilizar los mismos placeholders que usa /render
+        replacements = _build_replacements(request)
+
+        # 2) Agregar DATE solo si la plantilla lo usa
+        if request.proposal_date:
+            replacements["{{DATE}}"] = request.proposal_date.strftime("%B %d, %Y")
+        else:
+            replacements["{{DATE}}"] = ""
+            
         pptx_stream = generate_presentation(
             template_path=TEMPLATE_PATH,
             replacements=replacements,
-            slide_toggles=request.slide_toggles
+            slide_toggles=request.slide_toggles or {} # Agregar  or {}
         )
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as pptx_temp:
@@ -130,8 +143,76 @@ async def render_presentation_pdf(request: RenderRequest):
         raise HTTPException(status_code=500, detail=f"error converting to libreoffice: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"error general: {str(e)}")
+    
+    
+    
+"""
+@app.post("/render_pdf")
+async def render_presentation_pdf(request: RenderRequest):
+    ""
+    Nuevo endpoint que devuelve pdf en vez de pptx
+    ""
+    try:
+        if not os.path.exists(TEMPLATE_PATH):
+            raise HTTPException(status_code=500, detail="Template file not found.")
+        
+        # 1) Reutilizar los mismos placeholders que usa /render
+        replacements = _build_replacements(request)
 
-""" @app.post("/render-format")
-async def render_presentation_format(request: RenderRequest, format: str="pptx"):
-    Endpoint que devuelve pptx o pdf según el parámetro 'format'
-    try: """
+        # 2) Agregar DATE solo si la plantilla lo usa
+        if request.proposal_date:
+            replacements["{{DATE}}"] = request.proposal_date.strftime("%B %d, %Y")
+        else:
+            replacements["{{DATE}}"] = ""
+        
+        # 3) Generar PPTX con los mismos placeholders coherentes    
+        pptx_stream = generate_presentation(
+            template_path=TEMPLATE_PATH,
+            replacements=replacements,
+            slide_toggles=request.slide_toggles or {}
+        )
+
+        # 4) Guardar PPTX temporalmente
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as pptx_temp:
+            pptx_temp.write(pptx_stream.getvalue())
+            pptx_temp.flush()
+            pptx_path = pptx_temp.name
+
+        # 5) Convertir a PDF usando libreoffice
+        pdf_path = pptx_path.replace(".pptx", ".pdf")
+
+        subprocess.run([
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            pptx_path,
+            "--outdir",
+            os.path.dirname(pptx_path)
+        ], check=True)
+
+        # 6) Leer PDF generado
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        
+        # 7) Limpiar archivos temporales
+        os.remove(pptx_path)
+
+        os.remove(pdf_path)
+
+        # 8) Nombre seguro para el archivo
+        safe_company = "".join(c if c.isalnum() or c in " _-" else "_" for c in request.company_name)
+        filename = f"proposal_eic_template_{safe_company}.pdf"
+
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"error converting to libreoffice: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error general: {str(e)}")
+        
+"""
