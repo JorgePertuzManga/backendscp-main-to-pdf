@@ -145,74 +145,94 @@ async def render_presentation_pdf(request: RenderRequest):
         raise HTTPException(status_code=500, detail=f"error general: {str(e)}")
     
     
+@app.post("/render_pdf_custom")
+async def render_pdf_custom(request: RenderRequest, remove_slides: list[int] = []):
+    """
+    Genera un PDF desde la plantilla PPTX permitiendo al usuario eliminar
+    páginas específicas por número de slide (1-based index).
     
-"""
-@app.post("/render_pdf")
-async def render_presentation_pdf(request: RenderRequest):
-    ""
-    Nuevo endpoint que devuelve pdf en vez de pptx
-    ""
+    Ejemplo:
+    remove_slides = [2, 5, 7]
+    """
+
     try:
         if not os.path.exists(TEMPLATE_PATH):
             raise HTTPException(status_code=500, detail="Template file not found.")
-        
-        # 1) Reutilizar los mismos placeholders que usa /render
+
+        # 1) Construimos los replacements igual que /render y /render_pdf
         replacements = _build_replacements(request)
 
-        # 2) Agregar DATE solo si la plantilla lo usa
+        # Fecha opcional
         if request.proposal_date:
             replacements["{{DATE}}"] = request.proposal_date.strftime("%B %d, %Y")
         else:
             replacements["{{DATE}}"] = ""
-        
-        # 3) Generar PPTX con los mismos placeholders coherentes    
+
+        # 2) Convertir slides enviados por el usuario (1-based → 0-based)
+        #    Si pide eliminar slide 2 → eliminamos índice 1
+        remove_idx = sorted([s - 1 for s in remove_slides if s > 0])
+
+        # 3) Generar primero la presentación PPTX completa en memoria
         pptx_stream = generate_presentation(
             template_path=TEMPLATE_PATH,
             replacements=replacements,
             slide_toggles=request.slide_toggles or {}
         )
 
-        # 4) Guardar PPTX temporalmente
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as pptx_temp:
-            pptx_temp.write(pptx_stream.getvalue())
-            pptx_temp.flush()
-            pptx_path = pptx_temp.name
+        # 4) Guardarla temporalmente para poder manipularla
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_ppt:
+            temp_ppt.write(pptx_stream.getvalue())
+            temp_ppt.flush()
+            ppt_path = temp_ppt.name
 
-        # 5) Convertir a PDF usando libreoffice
-        pdf_path = pptx_path.replace(".pptx", ".pdf")
+        # 5) Abrir la presentación para eliminar páginas específicas
+        from pptx import Presentation
+        prs = Presentation(ppt_path)
+
+        # Importante: borrar desde atrás hacia adelante
+        for idx in reversed(remove_idx):
+            if 0 <= idx < len(prs.slides._sldIdLst):
+                rId = prs.slides._sldIdLst[idx].rId
+                prs.part.drop_rel(rId)
+                del prs.slides._sldIdLst[idx]
+
+        # 6) Guardar el PPTX ya modificado (sin slides)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as final_ppt:
+            prs.save(final_ppt.name)
+            final_ppt_path = final_ppt.name
+
+        # 7) Convertir a PDF con LibreOffice
+        pdf_path = final_ppt_path.replace(".pptx", ".pdf")
 
         subprocess.run([
             "libreoffice",
             "--headless",
-            "--convert-to",
-            "pdf",
-            pptx_path,
-            "--outdir",
-            os.path.dirname(pptx_path)
+            "--convert-to", "pdf",
+            final_ppt_path,
+            "--outdir", os.path.dirname(final_ppt_path),
         ], check=True)
 
-        # 6) Leer PDF generado
+        # Leer PDF
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
-        
-        # 7) Limpiar archivos temporales
-        os.remove(pptx_path)
 
+        # Limpiar archivos
+        os.remove(ppt_path)
+        os.remove(final_ppt_path)
         os.remove(pdf_path)
 
-        # 8) Nombre seguro para el archivo
+        # Nombre final
         safe_company = "".join(c if c.isalnum() or c in " _-" else "_" for c in request.company_name)
-        filename = f"proposal_eic_template_{safe_company}.pdf"
+        filename = f"proposal_custom_{safe_company}.pdf"
 
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
         )
-    
+
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"error converting to libreoffice: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LibreOffice conversion error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"error general: {str(e)}")
-        
-"""
+        raise HTTPException(status_code=500, detail=f"General error: {str(e)}")
+
