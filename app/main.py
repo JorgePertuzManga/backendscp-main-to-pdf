@@ -236,3 +236,113 @@ async def render_pdf_custom(request: RenderRequest, remove_slides: list[int] = [
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"General error: {str(e)}")
 
+
+@app.post("/render_pdf_advanced")
+async def render_pdf_advanced(
+    request: RenderRequest,
+    remove_slides: list[int] = [],
+    remove_tags: list[str] = []
+):
+    """
+    Genera un PDF permitiendo eliminar slides por:
+    - Número de slide (1-based index)
+    - TAG definido en las notas (ej: [[tag:financials]])
+    
+    Combina ambas reglas:
+    Si una slide coincide con número o tag → se elimina.
+    """
+
+    try:
+        if not os.path.exists(TEMPLATE_PATH):
+            raise HTTPException(status_code=500, detail="Template file not found.")
+        
+        # 1) Construir replacements igual que el resto de endpoints
+        replacements = _build_replacements(request)
+
+        # Fecha opcional
+        if request.proposal_date:
+            replacements["{{DATE}}"] = request.proposal_date.strftime("%B %d, %Y")
+        else:
+            replacements["{{DATE}}"] = ""
+
+        # 2) Generar un PPT preliminar (ya elimina tags según slide_toggles)
+        pptx_stream = generate_presentation(
+            template_path=TEMPLATE_PATH,
+            replacements=replacements,
+            slide_toggles=request.slide_toggles or {}
+        )
+
+        # 3) Guardar PPT preliminar
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_ppt:
+            temp_ppt.write(pptx_stream.getvalue())
+            temp_ppt.flush()
+            ppt_path = temp_ppt.name
+
+        # 4) Reabrir para aplicar la eliminación avanzada
+        from pptx import Presentation
+        prs = Presentation(ppt_path)
+
+        # --- Preparar índices a eliminar por número ---
+        # convertimos slide numbers (1-based) → índices internos (0-based)
+        remove_number_idx = sorted([s - 1 for s in remove_slides if s > 0])
+
+        # --- Preparar eliminación por TAG adicional ---
+        tag_indices = []
+        if remove_tags:
+            for i, slide in enumerate(prs.slides):
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text
+                    for tag in remove_tags:
+                        if f"[[tag:{tag}]]" in notes:
+                            tag_indices.append(i)
+                            break
+
+        # --- Unimos ambas listas ---
+        all_to_delete = sorted(set(remove_number_idx + tag_indices), reverse=True)
+
+        # --- Eliminar slides desde atrás ---
+        for idx in all_to_delete:
+            if 0 <= idx < len(prs.slides._sldIdLst):
+                rId = prs.slides._sldIdLst[idx].rId
+                prs.part.drop_rel(rId)
+                del prs.slides._sldIdLst[idx]
+
+        # 5) Guardar versión avanzada
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as final_ppt:
+            prs.save(final_ppt.name)
+            final_ppt_path = final_ppt.name
+
+        # 6) Convertir a PDF
+        pdf_path = final_ppt_path.replace(".pptx", ".pdf")
+
+        subprocess.run([
+            "libreoffice",
+            "--headless",
+            "--convert-to", "pdf",
+            final_ppt_path,
+            "--outdir", os.path.dirname(final_ppt_path),
+        ], check=True)
+
+        # Leer PDF final
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        # Limpiar temporales
+        os.remove(ppt_path)
+        os.remove(final_ppt_path)
+        os.remove(pdf_path)
+
+        # Nombre final del archivo
+        safe_company = "".join(c if c.isalnum() or c in " _-" else "_" for c in request.company_name)
+        filename = f"proposal_advanced_{safe_company}.pdf"
+
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
+        )
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"LibreOffice conversion error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"General error: {str(e)}")
